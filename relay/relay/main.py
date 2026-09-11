@@ -32,9 +32,11 @@ import loop as loop_module
 
 def _agent_for(name: str):
     """The one place that decides which provider backs which agent.
-    Both are real adapters now (message 016) -- neither has been
-    verified against a live network in this environment, which is a
-    fact about this sandbox, not about the code."""
+    Both are real adapters now (message 016) -- neither has produced a
+    real provider response yet, because no API key is configured in
+    this environment. Outbound network access is not the blocker
+    (confirmed with real HTTP round trips, message 019); only the
+    credential is."""
     if name == "lobster":
         return adapters.AnthropicAgent(name="lobster")
     return adapters.OpenAIAgent(name="pixl")
@@ -131,24 +133,27 @@ def cmd_live_status(args: argparse.Namespace) -> int:
         if e["seq"] not in delivered_or_replied and core.result_status(e["to"], e["seq"], events) == "UNKNOWN":
             counts["unknown_results"] += 1
 
-    heartbeats = {}
-    if loop_module.HEARTBEAT_PATH.exists():
-        hb = json.loads(loop_module.HEARTBEAT_PATH.read_text(encoding="utf-8"))
-        heartbeats[hb["agent"]] = hb
-
     print("communicAItion")
     print("-" * 28)
     print()
-    for agent in core.AGENTS:
-        hb = heartbeats.get(agent)
-        state = hb["status"].upper() if hb else "NO HEARTBEAT"
-        print(f"{agent.capitalize():<12}{state}")
+    print("Relay")
     print()
-    print(f"Messages              {counts['messages']}")
-    print(f"Successful turns      {counts['successful_turns']}")
-    print(f"Provider retries      {counts['provider_retries']}")
-    print(f"Unknown results       {counts['unknown_results']}")
-    print(f"Delivery failures     {counts['delivery_failures']}")
+    for agent in core.AGENTS:
+        hb = loop_module.read_heartbeat(agent, stale_after_s=args.stale_after)
+        print(f"{agent.capitalize()}")
+        if hb is None:
+            print("    status: NO HEARTBEAT")
+        else:
+            age = f"{hb['age_s']:.0f}s ago" if "age_s" in hb else "n/a"
+            print(f"    status: {hb['display_status']}")
+            print(f"    heartbeat: {age}")
+            print(f"    last cycle: {hb['last_cycle']}")
+        print()
+    print(f"Messages:              {counts['messages']}")
+    print(f"Successful turns:      {counts['successful_turns']}")
+    print(f"Provider retries:      {counts['provider_retries']}")
+    print(f"Unknown results:       {counts['unknown_results']}")
+    print(f"Delivery failures:     {counts['delivery_failures']}")
     print()
     for agent in core.AGENTS:
         ts = last_message_ts[agent]
@@ -197,6 +202,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_loop.set_defaults(func=cmd_loop)
 
     p_live = sub.add_parser("live-status", help="small operational view (message 018 section 12)")
+    p_live.add_argument("--stale-after", type=float, default=loop_module.DEFAULT_STALE_AFTER_S,
+                         dest="stale_after", help="seconds before a heartbeat displays as STALE")
     p_live.set_defaults(func=cmd_live_status)
 
     return p

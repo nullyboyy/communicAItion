@@ -119,10 +119,14 @@ class OpenAIAgent:
     same one-attempt contract, same urllib-only implementation, same
     AdapterError-on-any-failure behavior. This is real, correct code
     against OpenAI's Chat Completions API, but it is UNVERIFIED against
-    the live network, same as AnthropicAgent: this environment has no
-    outbound network access and no OPENAI_API_KEY configured. Message
-    016 asked this to be implemented/verified; implemented is honest,
-    verified is not, and I'm not blurring that line."""
+    a real response, same as AnthropicAgent: no OPENAI_API_KEY is
+    configured in this environment. (Outbound HTTPS to the real endpoint
+    IS reachable from here -- confirmed with real HTTP round trips in
+    message 019, correcting an assumption stated in messages 009 through
+    017 that turned out to be untested, not true. Only the credential is
+    missing.) Message 016 asked this to be implemented/verified;
+    implemented is honest, verified is not, and I'm not blurring that
+    line -- I'm just naming the correct remaining gap."""
 
     provider_name = "openai"
     API_URL = "https://api.openai.com/v1/chat/completions"

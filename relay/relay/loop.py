@@ -23,13 +23,22 @@ this is "max turns"), max_runtime_s, and a circuit breaker on consecutive
 cycle-level failures. None of these require a persistent deployment to
 be real -- they're plain Python control flow, testable right here.
 """
+import datetime
+import json
 import time
 from pathlib import Path
 from typing import List, Optional
 
 import core
 
-HEARTBEAT_PATH = core.ROOT / "state" / "heartbeat.json"
+HEARTBEAT_DIR = core.ROOT / "state" / "heartbeats"
+
+# Message 020's real finding: two independent processes (one per agent,
+# as the systemd deployment proposal has them) writing a single shared
+# heartbeat.json meant whichever wrote last silently erased the other's
+# record. Per-agent files fix that structurally -- there's no shared
+# file for two writers to race on.
+DEFAULT_STALE_AFTER_S = 30.0
 
 
 class CircuitOpen(Exception):
@@ -37,14 +46,51 @@ class CircuitOpen(Exception):
     exceed the breaker threshold. Not a crash -- a deliberate stop."""
 
 
+def heartbeat_path(agent_name: str) -> Path:
+    return HEARTBEAT_DIR / f"{agent_name}.json"
+
+
 def write_heartbeat(agent_name: str, cycle: int, last_seq_seen: int, status: str) -> None:
-    core.atomic_write_json(HEARTBEAT_PATH, {
+    HEARTBEAT_DIR.mkdir(parents=True, exist_ok=True)
+    core.atomic_write_json(heartbeat_path(agent_name), {
         "agent": agent_name,
         "status": status,
         "last_cycle": cycle,
         "last_message": last_seq_seen,
         "timestamp": core.now_iso(),
     })
+
+
+def _parse_iso_utc(ts: str) -> "datetime.datetime":
+    """datetime.fromisoformat() doesn't exist until Python 3.7 -- this
+    environment is 3.6.8. core.now_iso() always produces UTC with a
+    '+00:00' suffix (datetime.now(timezone.utc).isoformat(...)), so
+    stripping that fixed suffix and parsing the naive remainder is
+    exact for every timestamp this project ever writes, without pulling
+    in a dependency for general ISO 8601 parsing this doesn't need."""
+    assert ts.endswith("+00:00"), f"unexpected timestamp format: {ts!r}"
+    naive = datetime.datetime.strptime(ts[:-6], "%Y-%m-%dT%H:%M:%S")
+    return naive.replace(tzinfo=datetime.timezone.utc)
+
+
+def read_heartbeat(agent_name: str, stale_after_s: float = DEFAULT_STALE_AFTER_S) -> Optional[dict]:
+    """Returns the heartbeat dict with an added 'display_status' that
+    accounts for staleness -- a heartbeat isn't useful if a 3-day-old
+    "alive" record still reads as ONLINE. 'stopped' is left alone
+    regardless of age: an explicit stop is definite information, not
+    something that goes stale, unlike an unexplained silence."""
+    p = heartbeat_path(agent_name)
+    if not p.exists():
+        return None
+    hb = json.loads(p.read_text(encoding="utf-8"))
+    if hb["status"] == "stopped":
+        hb["display_status"] = "STOPPED"
+        return hb
+    ts = _parse_iso_utc(hb["timestamp"])
+    age_s = (datetime.datetime.now(datetime.timezone.utc) - ts).total_seconds()
+    hb["age_s"] = age_s
+    hb["display_status"] = "STALE" if age_s >= stale_after_s else "ONLINE"
+    return hb
 
 
 def _cycle_failure_delta(events: List[dict]) -> "tuple[int, int]":
@@ -56,8 +102,20 @@ def _cycle_failure_delta(events: List[dict]) -> "tuple[int, int]":
     the breaker immediately rather than needing N separate cycles to
     "notice." Any success in the same cycle resets the counter to zero
     in the caller: a provider that's working again shouldn't stay
-    tripped because of an older failure earlier in the same batch."""
-    n_failed = sum(1 for e in events if e.get("event") == "message_delivery_failed")
+    tripped because of an older failure earlier in the same batch.
+
+    Counts message_delivery_failed AND reply_stage_failed -- message 020
+    testing surfaced that only counting the former left a real gap: a
+    persistent staging failure (disk full, permissions) retries forever
+    (correctly, per section 2 -- it must not abandon a durable result)
+    but was invisible to the circuit breaker, which could let it loop
+    unbounded. A repeatedly-failing stage is exactly the kind of
+    "provider working, environment broken" condition the breaker exists
+    to catch, even though no provider call is failing."""
+    n_failed = sum(
+        1 for e in events
+        if e.get("event") in ("message_delivery_failed", "reply_stage_failed")
+    )
     n_delivered = sum(1 for e in events if e.get("event") == "message_delivered")
     return n_failed, n_delivered
 

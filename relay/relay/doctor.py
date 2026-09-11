@@ -83,25 +83,52 @@ def check_relay():
 
 
 def check_provider(name: str, env_var: str, host: str, adapter_cls, verify_live: bool):
+    """Four states (message 020 section 6), not the two this used to
+    conflate. The category error being guarded against: "endpoint
+    accepts invalid credentials" (REACHABLE) is not the same claim as
+    "our credential actually works" (AUTHENTICATED), which is not the
+    same claim as "the adapter correctly parsed a real response"
+    (ADAPTER_OK). One real call, when --verify-live is passed, is
+    enough to determine both of the last two together: if adapter.send()
+    returns text without raising, the request was both authenticated
+    and correctly parsed. If it raises with an HTTP 401/403 in the
+    message, that's specifically an authentication failure, not a
+    parsing one, and ADAPTER_OK is reported as SKIP rather than FAIL --
+    it was never attempted, because there's nothing to parse without a
+    successful response."""
     print(name)
     has_key = bool(os.environ.get(env_var))
-    _run(f"{env_var} configured", lambda: (has_key, None if has_key else "not set"))
-    reachable = _run(f"{host} reachable", lambda: _endpoint_reachable(host))
+    _run("configured", lambda: (has_key, None if has_key else f"{env_var} not set"))
+    reachable = _run("reachable", lambda: _endpoint_reachable(host))
 
     if not has_key or not reachable:
         reason = "no credentials" if not has_key else "endpoint unreachable"
-        print(f"    FAIL adapter responding -- skipped ({reason})")
+        print(f"    FAIL authenticated -- skipped ({reason})")
+        print(f"    FAIL adapter response parsed -- skipped ({reason})")
         return
 
     if not verify_live:
-        print("    SKIP adapter responding -- not attempted (pass --verify-live to actually spend one real call)")
+        print("    SKIP authenticated -- not attempted (pass --verify-live to actually spend one real call)")
+        print("    SKIP adapter response parsed -- not attempted")
         return
 
-    def _live_call():
+    try:
         agent = adapter_cls(max_tokens=8)
         reply = agent.send("Reply with exactly: OK")
-        return bool(reply.strip()), reply.strip()[:40]
-    _run("adapter responding (live call made)", _live_call)
+        print(f"    {_mark(True)} authenticated")
+        print(f"    {_mark(True)} adapter response parsed -- {reply.strip()[:40]!r}")
+    except adapters.AdapterError as e:
+        msg = str(e)
+        auth_failure = "HTTP 401" in msg or "HTTP 403" in msg
+        print(f"    FAIL authenticated -- {msg[:120]}")
+        if auth_failure:
+            print("    SKIP adapter response parsed -- not attempted (authentication failed first)")
+        else:
+            # Some other failure (5xx, malformed response, timeout) --
+            # authentication status is genuinely unknown here, not
+            # provably fine, so it's still reported FAIL above rather
+            # than guessed as OK.
+            print(f"    FAIL adapter response parsed -- {msg[:120]}")
 
 
 def run(verify_live: bool = False):
