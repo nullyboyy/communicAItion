@@ -55,13 +55,20 @@ import adapters
 
 AGENTS = ("lobster", "pixl")
 
-ROOT = Path(__file__).resolve().parent.parent  # .../relay
+# Test isolation (message 018, direct response to the real accident in
+# message 017 where a test's reset() overwrote the live shared_state.json).
+# RELAY_ROOT lets a test point every path in this module at an isolated
+# directory instead of the real project data, without needing every test
+# to remember to pass a root explicitly. Production/interactive use never
+# sets this, so ROOT still defaults to the real relay/ directory.
+ROOT = Path(os.environ.get("RELAY_ROOT", str(Path(__file__).resolve().parent.parent)))
 MESSAGES_DIR = ROOT / "messages"
 ARCHIVE_DIR = MESSAGES_DIR / "archive"
 FAILED_DIR = ARCHIVE_DIR / "failed"
 STATE_PATH = ROOT / "state" / "shared_state.json"
 LOG_PATH = ROOT / "history" / "log.jsonl"
 LOCK_PATH = ROOT / "state" / ".seq.lock"
+RESULTS_DIR = ROOT / "results"
 
 # Drop convention: sender-authored filename, no sequence number.
 # uid is a millisecond timestamp (13 zero-padded decimal digits) followed
@@ -496,6 +503,80 @@ def tail_events(n: int = 20) -> List[dict]:
 
 DEFAULT_BACKOFF = (1, 2, 4)
 
+# --- Durable request/result transaction (message 018) ---------------------
+#
+# Three states, exactly as specified, now real instead of terminology:
+#
+#   UNKNOWN         no results/<seq>.json exists yet. A provider retry
+#                   is allowed -- nothing durable would be lost by one.
+#   DURABLE_RESULT  results/<seq>.json exists: the exact provider output
+#                   is on disk, tagged by the message's own seq (reused
+#                   as the "request id" -- it's already stable, already
+#                   survives restarts via the log, and already unique
+#                   per logical agent turn; inventing a second ID scheme
+#                   alongside it would just be two names for one fact).
+#                   A provider retry is now FORBIDDEN for this seq --
+#                   deliver_pending reads the stored text instead.
+#   DELIVERED       a reply message exists that names this seq as its
+#                   reply_to (checked two ways: the message_delivered
+#                   log event, or an actual archived/staged reply file --
+#                   see _reply_already_attempted, already covers this).
+#
+# This directly shrinks the message-017 gap: the old code path was
+# "adapter returns -> stage reply -> log delivery," so a crash anywhere
+# in that stretch lost the answer and forced a re-call. Now it's
+# "adapter returns -> commit durable result -> stage reply (from the
+# durable copy, replayable) -> log delivery." The remaining true UNKNOWN
+# window is only between the provider call returning and one atomic
+# file write completing -- much smaller, not zero. Section 3 measures
+# exactly how much smaller.
+
+
+def result_path(seq: int) -> Path:
+    return RESULTS_DIR / f"{seq:06d}.json"
+
+
+def write_durable_result(seq: int, agent_name: str, attempt: int, result_text: str) -> None:
+    """The commit point. Once this returns, the provider must never be
+    called again for this seq -- the text survives right here, not in
+    process memory. Logs that a result was committed, but not the text
+    itself, matching the project's standing rule against dumping full
+    payloads into the log."""
+    RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write_json(result_path(seq), {
+        "seq": seq, "agent": agent_name, "attempt": attempt,
+        "ts": now_iso(), "result_text": result_text,
+    })
+    append_event({
+        "event": "result_committed", "ts": now_iso(),
+        "seq": seq, "agent": agent_name, "attempt": attempt,
+    })
+
+
+def load_durable_result(seq: int) -> Optional[dict]:
+    p = result_path(seq)
+    if not p.exists():
+        return None
+    return json.loads(p.read_text(encoding="utf-8"))
+
+
+def result_status(agent_name: str, seq: int, all_events: Optional[List[dict]] = None) -> str:
+    """UNKNOWN / DURABLE_RESULT / DELIVERED for one incoming message's
+    seq, as observed right now -- used by relay doctor and the status
+    view, not by deliver_pending itself (which needs the finer-grained
+    checks inline to decide what to do, not just what to report)."""
+    if all_events is None:
+        all_events, _ = read_log_safe()
+    delivered = any(e.get("event") == "message_delivered" and e.get("seq") == seq for e in all_events)
+    replied = any(
+        e.get("event") == "message_processed" and e.get("reply_to") == seq for e in all_events
+    )
+    if delivered or replied or _reply_already_attempted(agent_name, seq):
+        return "DELIVERED"
+    if load_durable_result(seq) is not None:
+        return "DURABLE_RESULT"
+    return "UNKNOWN"
+
 
 def _reply_already_attempted(agent_name: str, seq: int) -> bool:
     """Closes a residual race the log alone can't: send_message() drops
@@ -564,56 +645,66 @@ def deliver_pending(agent_name: str, agent: "adapters.AnthropicAgent", backoff=D
     results = []
     for e in pending:
         seq = e["seq"]
-        incoming_path = ARCHIVE_DIR / e["archived_as"]
-        incoming_body = incoming_path.read_text(encoding="utf-8")
-        assembled = context.build_context(agent_name, incoming_body, reply_to=seq)
 
-        # Deliberately does not log the assembled context itself, or any
-        # credential -- only that a turn started and for which message.
-        append_event({"event": "agent_turn_started", "ts": now_iso(), "seq": seq, "agent": agent_name})
+        # DURABLE_RESULT check first: if a provider already answered for
+        # this seq in a prior run, the answer is on disk -- use it, and
+        # the provider must not be called again for this seq, full stop.
+        existing = load_durable_result(seq)
+        if existing is not None:
+            reply_text = existing["result_text"]
+        else:
+            incoming_path = ARCHIVE_DIR / e["archived_as"]
+            incoming_body = incoming_path.read_text(encoding="utf-8")
+            assembled = context.build_context(agent_name, incoming_body, reply_to=seq)
 
-        reply_text = None
-        last_error = None
-        for attempt, delay in enumerate((0,) + tuple(backoff), start=1):
-            if delay:
+            # Deliberately does not log the assembled context itself, or
+            # any credential -- only that a turn started and for which message.
+            append_event({"event": "agent_turn_started", "ts": now_iso(), "seq": seq, "agent": agent_name})
+
+            reply_text = None
+            last_error = None
+            for attempt, delay in enumerate((0,) + tuple(backoff), start=1):
+                if delay:
+                    append_event({
+                        "event": "message_retrying", "ts": now_iso(),
+                        "seq": seq, "to": agent_name, "attempt": attempt, "delay_s": delay,
+                    })
+                    time.sleep(delay)
                 append_event({
-                    "event": "message_retrying", "ts": now_iso(),
-                    "seq": seq, "to": agent_name, "attempt": attempt, "delay_s": delay,
-                })
-                time.sleep(delay)
-            append_event({
-                "event": "provider_request_started", "ts": now_iso(),
-                "seq": seq, "agent": agent_name, "attempt": attempt,
-                "provider": getattr(agent, "provider_name", type(agent).__name__),
-            })
-            try:
-                reply_text = agent.send(assembled)
-                append_event({
-                    "event": "provider_request_succeeded", "ts": now_iso(),
+                    "event": "provider_request_started", "ts": now_iso(),
                     "seq": seq, "agent": agent_name, "attempt": attempt,
+                    "provider": getattr(agent, "provider_name", type(agent).__name__),
                 })
-                break
-            except adapters.AdapterError as err:
-                last_error = str(err)
-                append_event({
-                    "event": "provider_request_failed", "ts": now_iso(),
-                    "seq": seq, "agent": agent_name, "attempt": attempt, "reason": last_error,
-                })
+                try:
+                    reply_text = agent.send(assembled)
+                    append_event({
+                        "event": "provider_request_succeeded", "ts": now_iso(),
+                        "seq": seq, "agent": agent_name, "attempt": attempt,
+                    })
+                    write_durable_result(seq, agent_name, attempt, reply_text)  # COMMIT -- before staging
+                    break
+                except adapters.AdapterError as err:
+                    last_error = str(err)
+                    append_event({
+                        "event": "provider_request_failed", "ts": now_iso(),
+                        "seq": seq, "agent": agent_name, "attempt": attempt, "reason": last_error,
+                    })
 
-        if reply_text is None:
-            event = {
-                "event": "message_delivery_failed", "ts": now_iso(),
-                "seq": seq, "to": agent_name, "reason": last_error, "status": "failed",
-            }
-            append_event(event)
-            results.append(event)
-            continue
+            if reply_text is None:
+                event = {
+                    "event": "message_delivery_failed", "ts": now_iso(),
+                    "seq": seq, "to": agent_name, "reason": last_error, "status": "failed",
+                }
+                append_event(event)
+                results.append(event)
+                continue
 
-        # This is the boundary message 016 section 11 asks to measure: the
-        # provider has already answered (provider_request_succeeded is
-        # durable) but the reply file below does not exist yet. A crash in
-        # this exact gap loses the answer with no record of what it was --
-        # see LOBSTER_TO_PIXL_017.md for a real, induced measurement of it.
+        # As of message 018, the answer itself is already durable in
+        # results/<seq>.json by this point (or was loaded from there) --
+        # a crash here no longer loses what the model said, and a retry
+        # of just this staging step re-reads the same stored text rather
+        # than re-calling the provider. See LOBSTER_TO_PIXL_019.md for the
+        # crash matrix that measures what's left of the old gap.
         try:
             reply_path = send_message(agent_name, e["from"], reply_text, reply_to=seq)
         except Exception as err:

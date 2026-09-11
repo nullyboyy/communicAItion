@@ -26,6 +26,7 @@ from typing import List, Optional
 
 import adapters
 import core
+import doctor
 import loop as loop_module
 
 
@@ -90,11 +91,68 @@ def cmd_recover(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_doctor(args: argparse.Namespace) -> int:
+    doctor.run(verify_live=args.verify_live)
+    return 0
+
+
 def cmd_loop(args: argparse.Namespace) -> int:
     agent = _agent_for(args.agent)
-    events = loop_module.run_loop(args.agent, agent, poll_interval=args.interval, max_cycles=args.cycles)
-    print(f"ran {args.cycles if args.cycles is not None else 'unbounded'} cycle(s), "
-          f"{len(events)} events -- see log.jsonl for detail")
+    events = loop_module.run_loop(
+        args.agent, agent, poll_interval=args.interval, max_cycles=args.cycles,
+        max_runtime_s=args.max_runtime, max_consecutive_failures=args.max_failures,
+    )
+    stop = next((e for e in reversed(events) if e.get("event") == "relay_stopped"), None)
+    print(f"stopped: {stop['reason'] if stop else 'unknown'} after {stop['cycles_run'] if stop else '?'} cycle(s), "
+          f"{len(events)} events this run -- see log.jsonl for detail")
+    return 0
+
+
+def cmd_live_status(args: argparse.Namespace) -> int:
+    events, _ = core.read_log_safe()
+    counts = {"messages": 0, "successful_turns": 0, "provider_retries": 0,
+              "unknown_results": 0, "delivery_failures": 0}
+    last_message_ts = {a: None for a in core.AGENTS}
+    for e in events:
+        if e.get("event") == "message_processed":
+            counts["messages"] += 1
+            last_message_ts[e["from"]] = e["ts"]
+        elif e.get("event") == "message_delivered":
+            counts["successful_turns"] += 1
+        elif e.get("event") == "message_retrying":
+            counts["provider_retries"] += 1
+        elif e.get("event") == "message_delivery_failed":
+            counts["delivery_failures"] += 1
+
+    pending = [e for e in events if e.get("event") == "message_processed"]
+    delivered_or_replied = {e["seq"] for e in events if e.get("event") == "message_delivered"} | \
+                            {e["reply_to"] for e in events if e.get("event") == "message_processed" and e.get("reply_to")}
+    for e in pending:
+        if e["seq"] not in delivered_or_replied and core.result_status(e["to"], e["seq"], events) == "UNKNOWN":
+            counts["unknown_results"] += 1
+
+    heartbeats = {}
+    if loop_module.HEARTBEAT_PATH.exists():
+        hb = json.loads(loop_module.HEARTBEAT_PATH.read_text(encoding="utf-8"))
+        heartbeats[hb["agent"]] = hb
+
+    print("communicAItion")
+    print("-" * 28)
+    print()
+    for agent in core.AGENTS:
+        hb = heartbeats.get(agent)
+        state = hb["status"].upper() if hb else "NO HEARTBEAT"
+        print(f"{agent.capitalize():<12}{state}")
+    print()
+    print(f"Messages              {counts['messages']}")
+    print(f"Successful turns      {counts['successful_turns']}")
+    print(f"Provider retries      {counts['provider_retries']}")
+    print(f"Unknown results       {counts['unknown_results']}")
+    print(f"Delivery failures     {counts['delivery_failures']}")
+    print()
+    for agent in core.AGENTS:
+        ts = last_message_ts[agent]
+        print(f"Last {agent} message: {ts if ts else 'never'}")
     return 0
 
 
@@ -124,11 +182,22 @@ def build_parser() -> argparse.ArgumentParser:
     p_recover = sub.add_parser("recover", help="reconcile log/archive/state after an interruption")
     p_recover.set_defaults(func=cmd_recover)
 
+    p_doctor = sub.add_parser("doctor", help="diagnose environment/relay/provider readiness")
+    p_doctor.add_argument("--verify-live", action="store_true",
+                           help="actually spend one real provider call per configured provider")
+    p_doctor.set_defaults(func=cmd_doctor)
+
     p_loop = sub.add_parser("loop", help="run this agent's continuous transport+delivery loop")
     p_loop.add_argument("--agent", required=True, choices=core.AGENTS)
     p_loop.add_argument("--interval", type=float, default=2.0, help="seconds between cycles")
     p_loop.add_argument("--cycles", type=int, default=None, help="bounded cycle count; omit to run until Ctrl+C")
+    p_loop.add_argument("--max-runtime", type=float, default=None, dest="max_runtime", help="seconds before auto-stop")
+    p_loop.add_argument("--max-failures", type=int, default=5, dest="max_failures",
+                         help="consecutive delivery failures before the circuit breaker trips")
     p_loop.set_defaults(func=cmd_loop)
+
+    p_live = sub.add_parser("live-status", help="small operational view (message 018 section 12)")
+    p_live.set_defaults(func=cmd_live_status)
 
     return p
 

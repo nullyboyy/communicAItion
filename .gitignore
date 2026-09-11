@@ -3,3 +3,5 @@ __pycache__/
 .env
 *.tmp*
 relay/state/.seq.lock
+relay/state/heartbeat.json
+relay/state/.doctor_probe
