@@ -1,0 +1,169 @@
+{
+  "version": 3,
+  "objective": "Build a controlled local multi-agent collaboration system in which an Operator directs two cooperating agents, Lobster (primary implementer) and Pixl (secondary researcher/critic/designer), communicating through durable Markdown messages, an append-only JSONL event history, materialized/rebuildable JSON state, and recoverable identity/continuity artifacts, eventually via an automated local relay rather than operator-carried files. The system should remain provider-neutral rather than permanently coupled to one model vendor.",
+  "hierarchy": "Operator > Lobster > Pixl. Pixl does not outrank Lobster; Lobster owns implementation and final technical decisions subject to the Operator's authority. Pixl may challenge any decision and should escalate materially harmful decisions to the Operator rather than silently overriding the hierarchy. This hierarchy is a documented/social contract, not something the relay code mechanically enforces at runtime -- no permission check exists to bypass, noted explicitly per message 011's language/protocol test.",
+  "roles": {
+    "lobster": "Primary implementation and agentic engineer. Owns implementation, technical architecture, recovery mechanisms, adapter integration, correctness decisions, testing, and final technical decisions within the hierarchy.",
+    "pixl": "Secondary researcher, critic, product strategist, UI/graphic-design specialist, and architecture challenger. Owns challenging assumptions, identifying weaknesses, proposing experiments, questioning product/UX consequences, and identifying continuity/communication failures. Not merely agreement with Lobster."
+  },
+  "constraints": [
+    "Only Python 3.6.8 is available in the current implementation environment; relay code avoids syntax/stdlib features newer than that."
+  ],
+  "facts": [
+    "The relay has no code path that reads a message body's content and converts it into a state mutation or authority change; the protections tested in message 011 all reduce to this one structural fact.",
+    "shared_state.json's bookkeeping fields (last_seq, last_processed_seq) are rebuilt from history/log.jsonl and never hand-mutated; log.jsonl is the durable event authority."
+  ],
+  "decisions": [
+    {
+      "statement": "log.jsonl is the durable event authority; shared_state.json's bookkeeping fields are a materialized cache rebuilt from the log.",
+      "authority_source": "joint -- Pixl requested the invariant (msg006/008), Lobster implemented and tested it (msg009)",
+      "implementation_status": "implemented and tested (5 induced crash scenarios, msg009)",
+      "locked": true
+    },
+    {
+      "statement": "Provider adapters receive one pre-assembled context string; they never receive the raw shared_state dict or reach into project files themselves.",
+      "authority_source": "Lobster proposed as a correction to Pixl's original adapter signature (msg007); Pixl explicitly locked it (msg008 section 3)",
+      "implementation_status": "implemented (context.py, adapters.py)",
+      "locked": true
+    },
+    {
+      "statement": "Messages are immutable drop files with relay-assigned sequence numbers (never self-assigned by an agent), atomic rename into archive/, correlation via reply_to.",
+      "authority_source": "joint design, iterated msg004-007",
+      "implementation_status": "implemented and tested",
+      "locked": true
+    },
+    {
+      "statement": "archive/ is split into processed messages and archive/failed/ for malformed or terminally-failed ones, rather than one flat folder.",
+      "authority_source": "Lobster changed Pixl's original flat-archive proposal (msg005); Pixl affirmed 'keep it' (msg006)",
+      "implementation_status": "implemented and tested",
+      "locked": true
+    },
+    {
+      "statement": "Disagreements and their outcomes are tracked as one unified record (topic/lobster_position/pixl_position/decision/prediction/result/validated) rather than separate disputed[]/outcomes[] arrays.",
+      "authority_source": "Pixl proposed (msg006), Lobster implemented (msg007), Pixl confirmed (msg008 section 9, msg010 section 10)",
+      "implementation_status": "schema implemented; populated with real entries for the first time in message 012",
+      "locked": true
+    },
+    {
+      "statement": "No code path in the relay reads a message body's content and converts it into a state mutation or an authority change. This holds by omission -- there is no parser -- not by a filter that detects and blocks specific phrasings.",
+      "authority_source": "structural property, jointly tested and affirmed (msg009, msg010, msg011)",
+      "implementation_status": "verified by test across 6 adversarial message classes plus a 4-message repetition probe, all passing (msg011)",
+      "locked": true
+    },
+    {
+      "statement": "Compression is not a milestone ladder to climb. No compression milestone exists until repetition of a real pattern is observed; a compression only counts as a win if meaning is preserved AND total tokens (including any clarification round trip) are less than raw tokens.",
+      "authority_source": "Lobster challenged Pixl's original 6-phase ladder framing (msg007), Pixl accepted the correction and restated the rule (msg008 section 8, msg010 section 9)",
+      "implementation_status": "policy only -- no compression event has occurred yet to apply it to",
+      "locked": true
+    },
+    {
+      "statement": "Web UI, an autonomous/endless agent loop, hidden background chatter, a formal message envelope, a trigger matrix, and compression vocabulary are all explicitly deferred until their preconditions are met.",
+      "authority_source": "Pixl instructed (msg004/006/008/010), Lobster agreed and has complied",
+      "implementation_status": "correctly not built -- verified by absence in the codebase",
+      "locked": true
+    },
+    {
+      "statement": "Adapter delivery retries up to 3 times with 1s/2s/4s backoff; exhausted retries produce a terminal message_delivery_failed record that is never auto-retried, the same failure surface as a malformed message.",
+      "authority_source": "Lobster proposed, implemented, and tested (msg007, msg009)",
+      "implementation_status": "implemented and tested",
+      "locked": true
+    },
+    {
+      "statement": "PREPARE, VALIDATE, and STAGE (drafting, testing, and readying a reversible candidate change) never require Operator or cross-agent authorization by default, provided the item stays inside an agent's already-delegated domain and does not touch the objective, hierarchy, schema, or a cross-cutting decision. AUTHORIZE and EXECUTE always require it regardless of confidence, urgency, or reversibility. Concealing that PREPARE/VALIDATE/STAGE work happened is never permitted at any stage, independent of authorization status.",
+      "authority_source": "Pixl posed the authority-boundary stress test (msg014); Lobster derived and proposed this exact boundary in response (msg015); no objection raised",
+      "implementation_status": "policy, mapped onto existing code as an illustration (send_message()=PREPARE/STAGE, process_once()=EXECUTE) but not newly implemented -- this decision formalizes a distinction the code already drew implicitly",
+      "locked": true
+    }
+  ],
+  "disagreements": [
+    {
+      "topic": "adapter signature: raw state dict vs. pre-assembled context string",
+      "lobster_position": "adapter should receive only an assembled context string; letting it see raw state contradicts the 'adapter shouldn't own where project truth lives' boundary Pixl herself set",
+      "pixl_position": "originally proposed send(message, state, history_context) -- adapter receives raw state and history directly",
+      "decision": "Lobster's version adopted; Pixl explicitly locked it in msg008 section 3",
+      "prediction": "keeps provider swaps cheap and makes context selection an auditable single boundary",
+      "result": null,
+      "validated": false
+    },
+    {
+      "topic": "compression as a 6-phase escalation ladder vs. earned-only, per-instance measurement",
+      "lobster_position": "a phase ladder risks treating 'reaching protocol' as the success metric rather than 'stayed cheap and accurate'; measure each candidate compression by meaning_preserved + total_tokens instead",
+      "pixl_position": "originally proposed a NOTICE -> repeated structures -> shorthand -> tested -> protocol phase progression",
+      "decision": "Lobster's framing adopted; Pixl accepted the correction (msg008 section 8) and restated it as a hard rule (msg010 section 9)",
+      "prediction": "prevents manufacturing shorthand to satisfy a sense of progress rather than because it is actually cheaper",
+      "result": null,
+      "validated": false
+    }
+  ],
+  "open_questions": [
+    "Live Anthropic/OpenAI network delivery is unverified -- this sandbox has no outbound network access and no API keys configured, confirmed again in message 016/017's LIVE-01 work.",
+    "The duplicate-delivery window between an adapter call returning and the corresponding log entry being written is now concretely measured (message 016/017: a real hard-kill test produced exactly one duplicate provider call), not just theorized. Still not closed -- fully closing it would resemble the transaction framework both agents have agreed to defer.",
+    "Whether/when any compression vocabulary should be introduced is genuinely open -- contingent on observing real repeated communication patterns, not decided in advance.",
+    "What the TabAlien project actually is remains unanswered by the operator -- referenced early in the project as the next thing to work on after the relay, no details provided yet.",
+    "identity/PIXL.md does not exist. Pixl's own identity, personality, and self-description exist only in an early root-level blueprint document and in her own message prose, not as a durable artifact analogous to identity/LOBSTER.md."
+  ],
+  "risks": [
+    "The relay's hierarchy is documentation, not enforcement -- nothing currently prevents a future automated component from acting on a claimed-authority message if one is ever built without deliberately re-establishing this boundary.",
+    "A decisions[] entry's authority_source field is honesty-dependent, not structurally enforced: Lobster is the sole writer of shared_state.json and could fabricate an authority_source for something that was never actually jointly agreed, and nothing would catch it except an independent audit against real message history (msg015 section 10). This is a materially weaker guarantee than the structural 'no code path' protections elsewhere in this project.",
+    "A test-harness script (crash_tests.py) that calls default_state() to reset transport artifacts between test cases will also silently wipe all human-curated content fields if pointed at the real shared_state.json instead of an isolated test copy -- this happened for real during message 016/017's regression run and was caught and restored, not left broken. Lesson: test harnesses that reset state should operate on an isolated copy, not the live file, going forward."
+  ],
+  "research_needed": [],
+  "technical_debt": [
+    "Live provider/network verification pending (no network access, no API key, in current sandbox).",
+    "Duplicate-delivery residual window after adapter return, before log commit -- now concretely measured (message 016/017), still not closed.",
+    "Transaction-like guarantees (write-ahead across multiple files) intentionally deferred.",
+    "Python 3.6.8 is the only interpreter available in this environment; relay code was written compatible with it. Should not become a permanent constraint.",
+    "identity/PIXL.md does not exist yet."
+  ],
+  "implementation_status": {
+    "filesystem_relay": "implemented, tested",
+    "lobster_adapter_anthropic": "implemented (urllib-based), network path unverified",
+    "pixl_adapter_openai": "implemented (urllib-based, message 016/017), network path unverified",
+    "deterministic_context_builder": "implemented, tested",
+    "causal_history_reconstruction": "implemented (reply_to backward walk, 3-hop cap)",
+    "crash_recovery": "implemented, tested (5 induced failure cases, msg009; re-verified msg016/017 after instrumentation changes)",
+    "log_as_authority": "implemented, tested",
+    "duplicate_delivery_guard": "implemented (filesystem check), residual window now concretely measured, not closed",
+    "continuity_state": "populated message 012, extended message 015, restored after an accidental wipe message 016/017",
+    "autonomous_polling_loop": "implemented (loop.py), tested end-to-end with stand-in adapters (no live network) -- fully automated multi-message exchange with zero manual file moves after one operator-injected message",
+    "lifecycle_observability": "implemented -- message_discovered/validated, agent_turn_started, provider_request_started/succeeded/failed, reply_staged/reply_stage_failed, relay_started/cycle_started/relay_cycle_completed, recovery_applied",
+    "identity_lobster": "exists (identity/LOBSTER.md)",
+    "identity_pixl": "does not exist",
+    "web_ui": "deferred",
+    "compression_protocol": "deferred, policy-only rule recorded",
+    "formal_message_envelope": "deferred",
+    "trigger_matrix": "deferred"
+  },
+  "continuity": {
+    "last_fresh_process_test": {
+      "message": 13,
+      "score": "9/10 directly stated, one honest NOT PRESENT (next implementation step)",
+      "note": "second fresh-process test, after the message 012 continuity repair; first test (message 11) scored 1 PASS / 4 PARTIAL / 4 FAIL out of 9"
+    },
+    "identity_files": {
+      "lobster": "identity/LOBSTER.md",
+      "pixl": "MISSING"
+    },
+    "known_gap": "this file was empty of project content through message 011; populated message 012; extended message 015; briefly and accidentally wiped to defaults during message 016/017's crash-test regression run by a test harness that reset the live file instead of an isolated copy, then restored from the same session's context before being reported as fixed"
+  },
+  "protocol": {
+    "vocabulary": [
+      {
+        "term": "LOCK",
+        "meaning": "a decision has been reached that both agents intend to persist and treat as settled until explicitly revisited by new agreement",
+        "scope": "decisions[] and disagreements[] entries -- sets a decision's locked status",
+        "introduced_by": "Pixl (informal usage since her original blueprint), formally defined jointly in message 012",
+        "authority": "joint agreement, recorded explicitly by Lobster in shared_state.json with message 012 as the durable record of the proposal and its acceptance",
+        "state_effect": "when applied to a decisions[] entry, sets that entry's locked field to true",
+        "reversible": "yes, only by explicit new agreement -- not by repetition, confidence, or unilateral claim"
+      }
+    ],
+    "compression_level": 0,
+    "rule": "No compression milestone exists until repetition of a real pattern is observed. A candidate compression only counts as a win if meaning_preserved=true AND total_tokens < raw_tokens, counting any clarification round-trip against it."
+  },
+  "last_seq": 0,
+  "last_processed_seq": {
+    "lobster": 0,
+    "pixl": 0
+  }
+}
